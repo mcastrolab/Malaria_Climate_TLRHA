@@ -1,0 +1,168 @@
+---
+title: "Regression_mcc"
+author: "Nicholas Arisco"
+date: "2024-04-30"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: "hide"
+---
+# Description
+This RMarkdown document performs a stratified case-crossover analysis of climate variables and health outcomes across Brazilian states. It uses distributed lag nonlinear models (DLNM) and generalized nonlinear models (GNM) to estimate municipality-specific relative risks for precipitation, temperature, and diurnal variation at multiple lag periods (1, 2, and 3 weeks). Results are saved for meta-analysis and visualized by state. The script is structured for collaborative development on GitHub with reproducibility in mind.
+
+
+# Loading Libraries
+Load all required libraries for data manipulation, visualization, and modeling.
+```{r load_libraries, echo=TRUE, message=FALSE, warning=FALSE}
+library(tidyverse)      # Data manipulation & visualization
+dplyr::summarise.inform <- FALSE  # Suppress summarise() info messages
+library(lubridate)      # Date handling
+library(readxl)         # Reading Excel files
+library(htmlTable)      # HTML tables
+library(table1)         # Table summaries
+library(kableExtra)     # Enhanced tables for HTML/PDF/Markdown
+library(gnm)            # Generalized nonlinear models
+library(dlnm)           # Distributed lag nonlinear models
+library(splines)        # Spline functions for modeling
+library(mixmeta)        # Multivariate meta-analysis
+library(rlist)          # List manipulation
+library(data.table)     # Fast reading/writing and manipulation of large datasets
+```
+
+# Load Data
+Read in the primary dataset containing case-crossover data.
+```{r load_data}
+d1m3 <- fread("")
+```
+
+# Exploratory Statistics for Mato Grosso (UF==51)
+Convert units where necessary (Kelvin to Celsius, meters to cm).
+```{r exploratory_stats}
+# Temperature: Kelvin to Celsius
+median(d1m3$mean_temp_2week_avg[d1m3$UF == 51]) - 273.15
+median(d1m3$mean_temp_3week_avg[d1m3$UF == 51]) - 273.15
+
+# Precipitation: meters to centimeters
+median(d1m3$precipitation_2week_sum[d1m3$UF == 51]) * 100
+median(d1m3$precipitation_3week_sum[d1m3$UF == 51]) * 100
+
+# Diurnal variation
+median(d1m3$diurnal_variation_1week[d1m3$UF == 51])
+median(d1m3$diurnal_variation_3week[d1m3$UF == 51])
+```
+
+# Clean and Prepare Data
+Add time-based variables and unique IDs for stratification.
+```{r clean_data}
+d1m3 <- d1m3 %>%
+  mutate(
+    week = week(date),
+    dow = weekdays(date),
+    month = month(date),
+    ID2 = paste(ID, month)
+  )
+```
+
+# Function to Split Dataset
+Split data by stratification variable (UF) and keep groups with > `min_obs` rows.
+```{r split_function}
+split_dataset <- function(dataset, group_var, min_obs = 0) {
+  split_data <- split(dataset, dataset[[group_var]])
+  filtered_data <- split_data[sapply(split_data, nrow) > min_obs]
+  return(filtered_data)
+}
+
+# Split data for analysis
+mcc <- split_dataset(d1m3, "UF", 0)
+```
+
+# Model Formula
+Define variables for generalized nonlinear model.
+```{r model_formula}
+formula <- case ~
+  precipitation_CB1w + mean_temp_CB1w + diurnal_CB1w +
+  precipitation_CB2w + mean_temp_CB2w + diurnal_CB2w +
+  precipitation_CB3w + mean_temp_CB3w + diurnal_CB3w +
+  extreme_precipitation + temperature_2m_max + as.factor(week)
+```
+
+# Municipality-Specific Regressions
+Iterate over each state (UF), fit DLNM, and save reduced cumulative results.
+```{r run_models, eval=FALSE}
+# Pre-allocate result lists
+result_lists <- list(
+  redprec1w.2 = vector("list", length(mcc)),
+  redprec2w.2 = vector("list", length(mcc)),
+  redprec3w.2 = vector("list", length(mcc)),
+  redtemp1w.2 = vector("list", length(mcc)),
+  redtemp2w.2 = vector("list", length(mcc)),
+  redtemp3w.2 = vector("list", length(mcc)),
+  reddiur1w.2 = vector("list", length(mcc)),
+  reddiur2w.2 = vector("list", length(mcc)),
+  reddiur3w.2 = vector("list", length(mcc))
+)
+
+# Loop through each group
+for (i in seq_along(mcc)) {
+  cat("Running model for group:", names(mcc)[i], "\n")
+  data2 <- mcc[[i]]
+
+  # Define crossbasis for 1-, 2-, 3-week lag periods
+  crossbases <- lapply(c("1week", "2week", "3week"), function(period) {
+    list(
+      precipitation = crossbasis(data2[[paste0("precipitation_", period, "_sum")]],
+                                 argvar = list(fun="bs", knots=quantile(data2[[paste0("precipitation_", period, "_sum")]], c(0.1, 0.75, 0.9))),
+                                 lag=0, arglag=list(fun="bs", df=3)),
+      mean_temp = crossbasis(data2[[paste0("mean_temp_", period, "_avg")]],
+                             argvar = list(fun="bs", knots=quantile(data2[[paste0("mean_temp_", period, "_avg")]], c(0.1, 0.75, 0.9))),
+                             lag=0, arglag=list(fun="bs", df=3)),
+      diurnal = crossbasis(data2[[paste0("diurnal_variation_", period)]],
+                           argvar = list(fun="bs", knots=quantile(data2[[paste0("diurnal_variation_", period)]], c(0.1, 0.75, 0.9))),
+                           lag=0, arglag=list(fun="bs", df=3))
+    )
+  })
+
+  # Fit the GNM model
+  model <- gnm(formula, data=data2, eliminate=as.factor(ID), family=quasipoisson())
+
+  # Reduce to cumulative exposure-response relationships
+  result_lists$redprec1w.2[[i]] <- crossreduce(crossbases[[1]]$precipitation, model)
+  result_lists$redprec2w.2[[i]] <- crossreduce(crossbases[[2]]$precipitation, model)
+  result_lists$redprec3w.2[[i]] <- crossreduce(crossbases[[3]]$precipitation, model)
+
+  result_lists$redtemp1w.2[[i]] <- crossreduce(crossbases[[1]]$mean_temp, model)
+  result_lists$redtemp2w.2[[i]] <- crossreduce(crossbases[[2]]$mean_temp, model)
+  result_lists$redtemp3w.2[[i]] <- crossreduce(crossbases[[3]]$mean_temp, model)
+
+  result_lists$reddiur1w.2[[i]] <- crossreduce(crossbases[[1]]$diurnal, model)
+  result_lists$reddiur2w.2[[i]] <- crossreduce(crossbases[[2]]$diurnal, model)
+  result_lists$reddiur3w.2[[i]] <- crossreduce(crossbases[[3]]$diurnal, model)
+}
+```
+
+# Save Model Outputs
+Save each set of results as RDS for later use.
+```{r save_results, eval=FALSE}
+lapply(names(result_lists), function(name) {
+  saveRDS(result_lists[[name]], file = paste0("", name, ".RData"))
+})
+```
+
+# Visualization: Diurnal Variation
+Plot RR vs predictor for each municipality and lag.
+```{r plot_diurnal}
+# Combine and plot results (repeat similar process for temp & precip)
+# Example: results_diurnal_1week <- combine_results(reddiur1w.2)
+# ggplot(results_diurnal_1week, aes(...)) + geom_ribbon(...) + geom_line(...)
+```
+
+# Export Combined Results to CSV
+Write combined results for meta-analysis or mapping.
+```{r export_results, eval=FALSE}
+write.csv(results_prec, "/path/to/results_precipitation.csv")
+write.csv(results_temp, "/path/to/results_temperature.csv")
+write.csv(results_diur, "/path/to/results_diurnal.csv")
+```
+
+---

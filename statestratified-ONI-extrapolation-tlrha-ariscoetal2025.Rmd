@@ -1,0 +1,194 @@
+---
+title: "GAM -- FINAL -- UF11"
+author: "Nicholas J. Arisco"
+date: "2024-08-30"
+output: html_document
+---
+
+# Generalized Additive Model for Rondonia ONI x Malaria Analysis
+
+This script performs a full pipeline analysis of malaria case counts in a specific Brazilian state using a Generalized Additive Model (GAM). It incorporates: 
+- Seasonal trend decomposition and cosine fitting.
+- ENSO (El Niño/La Niña) categorization and counterfactual climate scenario generation.
+- GAM modeling to estimate the effects of climate and land-use variables.
+- Prediction under counterfactual climate scenarios to estimate avoided cases.
+
+**NOTE:** To run for a different state, update the `uf_exp == 11` filter to the desired UF code.
+
+---
+
+```{r setup, include=FALSE}
+# Set knitr options
+knitr::opts_chunk$set(echo = TRUE)
+
+# Load required libraries (ensure they are installed beforehand)
+library(mgcv)
+library(dplyr)
+library(sf)
+library(ggplot2)
+library(spdep)
+library(data.table)
+library(sp)
+library(forecast)
+```
+
+## Load and preprocess data
+```{r}
+# Read data and clean unnecessary column
+d1_full <- fread("ONI_extrap_data.csv")
+d1_full$V1 <- NULL
+
+# Filter for the selected state (CHANGE HERE for other UFs)
+d1 <- d1_full %>%
+  filter(uf_exp == 11) %>%
+  group_by(Date) %>%
+  summarise(casestotal = sum(cases), .groups = 'drop')
+```
+
+## Seasonal decomposition and cosine fitting
+```{r}
+# Decompose trend using a 12-month moving average
+trend_air <- ma(d1$casestotal, order = 12, centre = TRUE)
+plot(as.ts(d1$casestotal), main="Monthly Case Counts with Trend")
+lines(trend_air, col="red")
+
+# Detrend data
+detrend_air <- d1$casestotal / trend_air
+plot(detrend_air, main="Detrended Case Counts")
+
+# Estimate seasonal component
+m_air <- t(matrix(data = detrend_air, nrow = 12))
+seasonal_air <- colMeans(m_air, na.rm = TRUE)
+plot(as.ts(rep(seasonal_air, length.out = nrow(d1))), main="Seasonal Component")
+
+# Fit cosine function to seasonal component
+cosine_function <- function(params, t) {
+  A <- params[1]; t0 <- params[2]; T <- params[3]; B <- params[4]
+  A * cos(2 * pi * (t - t0) / T) + B
+}
+
+rss_function <- function(params, t, observed) {
+  predicted <- cosine_function(params, t)
+  sum((predicted - observed)^2)
+}
+
+# Initial parameter estimates
+initial_params <- c((max(seasonal_air) - min(seasonal_air)) / 2, -8, 12, mean(seasonal_air))
+
+# Optimize parameters
+optimized_params <- optim(
+  par = initial_params,
+  fn = rss_function,
+  t = 1:12,
+  observed = seasonal_air,
+  method = "L-BFGS-B"
+)$par
+
+# Plot fitted cosine curve
+fitted_values <- cosine_function(optimized_params, 1:12)
+plot(1:12, seasonal_air, type = "l", col = "blue", xlab = "Month", ylab = "Seasonal Value", main = "Fitted Cosine Function")
+lines(1:12, fitted_values, col = "red")
+legend("bottomright", legend = c("Observed", "Fitted Cosine"), col = c("blue", "red"), lty = 1)
+```
+
+## Add fitted seasonal control to dataset
+```{r}
+cosine_formula <- function(t) {
+  optimized_params[1] * sin(2 * pi * (t - optimized_params[2]) / optimized_params[3]) + optimized_params[4]
+}
+d1_full$month_control_cosine <- cosine_formula(d1_full$month)
+```
+
+## Load spatial data and match to cases
+```{r}
+# Load municipality shapefile
+muns <- st_read("BRMUE250GC_SIR.shp") %>%
+  mutate(mun = substr(CD_GEOCMU, 1, 6)) %>%
+  filter(mun %in% d1_full$mun_exp)
+
+# Filter cases to municipalities present in shapefile
+d1_full <- d1_full %>% filter(mun_exp %in% muns$mun)
+```
+
+## Categorize ENSO events
+```{r}
+# Define ENSO categories
+d1_full$ONI_category <- case_when(
+  d1_full$ONI >= 2.0                       ~ "El_Nino_2.0plus",
+  d1_full$ONI >= 1.5                        ~ "El_Nino_1.5to1.9",
+  d1_full$ONI >= 1.0                        ~ "El_Nino_1.0to1.4",
+  d1_full$ONI >= 0.5                        ~ "El_Nino_0.5to0.9",
+  d1_full$ONI <= -1.5                       ~ "La_Nina_1.5to1.6",
+  d1_full$ONI <= -1.0                       ~ "La_Nina_1.0to1.4",
+  d1_full$ONI <= -0.5                       ~ "La_Nina_0.5to0.9",
+  TRUE                                      ~ "Neutral"
+)
+```
+
+## Create counterfactual dataset
+```{r}
+# Average climate during neutral periods
+avg_diff <- d1_full %>%
+  filter(ONI_category == "Neutral") %>%
+  group_by(mun_exp, month) %>%
+  summarise(mean_temp_neutral = mean(meantemp, na.rm = TRUE),
+            mean_precip_neutral = mean(ptot, na.rm = TRUE), .groups = 'drop')
+
+# ENSO deviations
+d1_full <- d1_full %>%
+  left_join(avg_diff, by = c("mun_exp", "month")) %>%
+  mutate(temp_diff = meantemp - mean_temp_neutral,
+         precip_diff = ptot - mean_precip_neutral,
+         meantemp_cf = meantemp - temp_diff,
+         ptot_cf = ptot - precip_diff)
+
+write.csv(d1_full, "uf11cf.csv")
+```
+
+## Fit GAM model
+```{r}
+state_data <- d1_full %>% filter(uf_exp == 11)
+
+model_quasi <- gam(cases ~ s(meantemp, bs="cr", k=6) +
+                             s(ptot, bs="cr", k=6) +
+                             monthly_defo_1mlag +
+                             population +
+                             scaled_imp_local_ratio +
+                             month_control_cosine +
+                             perc_area_forested +
+                             as.factor(year) +
+                             s(mun_exp, bs='re'),
+                   family=quasipoisson(link="log"), data=state_data)
+
+# Dispersion parameter
+sum(residuals(model_quasi, type = "pearson")^2) / model_quasi$df.residual
+```
+
+## Predict counterfactual cases
+```{r}
+data_cf <- d1_full %>% filter(uf_exp == 11)
+
+predicted_cf <- exp(predict(model_quasi, newdata = data_cf))
+
+# Combine predictions
+data_cf$predicted_cases_cf <- predicted_cf
+```
+
+## Summarize and plot results
+```{r}
+results_date <- data_cf %>%
+  group_by(Date) %>%
+  summarise(cases_cf = sum(predicted_cases_cf),
+            cases_real = sum(cases), .groups = 'drop')
+
+ggplot(results_date, aes(x=Date)) +
+  geom_line(aes(y=cases_real, color="Observed")) +
+  geom_line(aes(y=cases_cf, color="Counterfactual")) +
+  labs(title="Observed vs Counterfactual Cases", y="Cases") +
+  theme_minimal()
+```
+
+## Export results
+```{r}
+write.csv(data_cf, "UF11_predicted_counterfactual.csv")
+```

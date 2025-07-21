@@ -1,0 +1,153 @@
+---
+title: "Whole Amazon -- Case Crossover -- All Weeks"
+author: "Nicholas J. Arisco"
+date: "2024-05-09"
+output: html_document
+---
+
+# Whole Amazon: Case-Crossover Analysis (All Weeks)
+
+This RMarkdown notebook performs a case-crossover analysis of malaria risk in the Brazilian Amazon. It models relationships between weekly weather metrics and malaria incidence using distributed lag nonlinear models (DLNMs) with generalized nonlinear models (GNMs). Outputs include relative risk (RR) estimates for mean temperature, precipitation, and diurnal variation across 1–3 week exposure windows.
+
+Repository Note:
+This script is part of the Malaria & Weather Amazon Analysis repository. Data can be requested through the Brazilian government. We are not at liberty to share.
+---
+
+## Packages
+```{r}
+# Load required libraries
+library(mgcv)        # Generalized additive models
+install.packages("dlnm") # Install DLNM package for cross-basis functions
+library(dlnm)        # Distributed Lag Nonlinear Models
+library(splines)     # Spline functions for smooth terms
+install.packages("gnm")  # Install GNM package for generalized nonlinear models
+library(gnm)         # Generalized nonlinear models
+library(data.table)  # Efficient data loading and manipulation
+library(dplyr)       # Data wrangling
+library(ggplot2)     # Data visualization
+```
+
+Load the Data
+``` {r}
+
+# Read in malaria and weather dataset
+d1m3 <- fread(file = "datafilehere")
+
+# Create year and week variables for temporal stratification
+d1m3$year <- year(d1m3$date)
+d1m3$week <- week(d1m3$date)  # Epidemiological week
+```
+
+Create Cross-Basis Functions
+Cross-basis functions are defined for each weather metric at 1-, 2-, and 3-week exposure windows. We use natural cubic splines for variable and lag dimensions.
+
+```{r}
+
+# --- Precipitation (1 week lag) ---
+precipitation_knots_1w <- quantile(d1m3$precipitation_1week_sum, c(0.10, 0.75, 0.90))
+precipitation_CB1w <- crossbasis(
+  d1m3$precipitation_1week_sum, 
+  argvar=list(fun="bs", knots=precipitation_knots_1w), 
+  lag=0, 
+  arglag=list(fun="bs", df=3)
+)
+
+# --- Mean Temperature (1 week lag) ---
+mean_temp_knots1w <- quantile(d1m3$mean_temp_1week_avg, c(0.10, 0.75, 0.90))
+mean_temp_CB1w <- crossbasis(
+  d1m3$mean_temp_1week_avg, 
+  argvar=list(fun="bs", knots=mean_temp_knots1w), 
+  lag=0, 
+  arglag=list(fun="bs", df=3)
+)
+
+# --- Diurnal Variation (1 week lag) ---
+diurnal_knots1w <- quantile(d1m3$diurnal_variation_1week, c(0.10, 0.75, 0.90))
+diurnal_CB1w <- crossbasis(
+  d1m3$diurnal_variation_1week, 
+  argvar=list(fun="bs", knots=diurnal_knots1w), 
+  lag=0, 
+  arglag=list(fun="bs", df=3)
+)
+
+# Repeat for 2-week and 3-week exposure windows
+# --- Precipitation (2 weeks) ---
+precipitation_knots_2w <- quantile(d1m3$precipitation_2week_sum, c(0.10, 0.75, 0.90))
+precipitation_CB2w <- crossbasis(
+  d1m3$precipitation_2week_sum, 
+  argvar=list(fun="bs", knots=precipitation_knots_2w), 
+  lag=0, 
+  arglag=list(fun="bs", df=3)
+)
+
+# --- Mean Temperature (2 weeks) ---
+mean_temp_knots2w <- quantile(d1m3$mean_temp_2week_avg, c(0.10, 0.75, 0.90))
+mean_temp_CB2w <- crossbasis(
+  d1m3$mean_temp_2week_avg, 
+  argvar=list(fun="bs", knots=mean_temp_knots2w), 
+  lag=0, 
+  arglag=list(fun="bs", df=3)
+)
+
+# --- Diurnal Variation (2 weeks) ---
+diurnal_knots2w <- quantile(d1m3$diurnal_variation_2week, c(0.10, 0.75, 0.90))
+diurnal_CB2w <- crossbasis(
+  d1m3$diurnal_variation_2week, 
+  argvar=list(fun="bs", knots=diurnal_knots2w), 
+  lag=0, 
+  arglag=list(fun="bs", df=3)
+)
+
+# Repeat for 3-week exposures (precipitation, temperature, diurnal)
+
+```
+Run the Model
+The model includes all cross-basis functions, extreme weather indicators, and week fixed effects. Individual IDs are eliminated as strata for case-crossover design.
+
+```{r}
+
+model <- gnm(
+  formula = case ~ 
+    precipitation_CB1w + mean_temp_CB1w + diurnal_CB1w +
+    precipitation_CB2w + mean_temp_CB2w + diurnal_CB2w +
+    precipitation_CB3w + mean_temp_CB3w + diurnal_CB3w +
+    extreme_precipitation + temperature_2m_max + as.factor(week),
+  eliminate = as.factor(ID), # Controls for individual-level effects
+  family = "quasipoisson",   # Accounts for overdispersion
+  data = d1m3
+)
+
+
+# summary(model) # Uncomment for model diagnostics
+
+```
+
+Extract Model Results
+Relative risks (RR) for mean temperature, precipitation, and diurnal variation are predicted at each exposure window for plotting.
+
+```{r}
+# --- Mean Temperature RR ---
+pred.mean_temp1 <- crossreduce(mean_temp_CB1w, model, cen=median(d1m3$mean_temp_1week_avg),
+                               value=min(d1m3$mean_temp_1week_avg):max(d1m3$mean_temp_1week_avg))
+pred.mean_temp1week <- data.frame(with(pred.mean_temp1, t(rbind(RRfit, RRlow, RRhigh))))
+pred.mean_temp1week$lag <- "1 week"
+
+# Repeat for 2 weeks and 3 weeks
+pred.mean_temp2 <- crossreduce(mean_temp_CB2w, model, cen=median(d1m3$mean_temp_2week_avg),
+                               value=min(d1m3$mean_temp_2week_avg):max(d1m3$mean_temp_2week_avg))
+pred.mean_temp2week <- data.frame(with(pred.mean_temp2, t(rbind(RRfit, RRlow, RRhigh))))
+pred.mean_temp2week$lag <- "2 weeks"
+
+pred.mean_temp3 <- crossreduce(mean_temp_CB3w, model, cen=median(d1m3$mean_temp_3week_avg),
+                               value=min(d1m3$mean_temp_3week_avg):max(d1m3$mean_temp_3week_avg))
+pred.mean_temp3week <- data.frame(with(pred.mean_temp3, t(rbind(RRfit, RRlow, RRhigh))))
+pred.mean_temp3week$lag <- "3 weeks"
+
+# Combine results
+tempRR <- rbind(pred.mean_temp1week, pred.mean_temp2week, pred.mean_temp3week)
+
+# Repeat for Precipitation and Diurnal Variation
+# Resulting dataframes: precipitationRR, diurnalRR
+
+```
+

@@ -1,0 +1,27 @@
+# RStudio files
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+
+# RMarkdown output
+*.html
+*.pdf
+*.docx
+*_cache/
+*_files/
+
+# Temporary files
+*.log
+*.aux
+*.out
+*.toc
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Data files (if large and sensitive)
+data/
+*.csv
+*.xlsx
